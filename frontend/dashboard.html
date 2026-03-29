@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="th">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Log Integrity Auditor — Row-by-Row Chain</title>
+    <link rel="icon" href="data:,">
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-slate-900 text-slate-100 p-6 md:p-12 font-sans">
+
+    <div class="max-w-7xl mx-auto">
+        <!-- Header -->
+        <div class="flex flex-col md:flex-row justify-between items-center mb-8 gap-4">
+            <div>
+                <h1 class="text-3xl font-bold text-blue-400">🛡️ Log Integrity Auditor</h1>
+                <p class="text-slate-400 mt-2 text-sm" id="lastUpdate">กำลังเชื่อมต่อกับเซิร์ฟเวอร์...</p>
+            </div>
+            <div class="flex gap-3 flex-wrap">
+                <div
+                    class="bg-slate-800 px-4 py-2 rounded-full border border-slate-700 flex items-center gap-2 text-sm shadow-lg">
+                    <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
+                    <span class="font-semibold" id="stateInfo">กำลังโหลด...</span>
+                </div>
+                <div
+                    class="bg-slate-800 px-4 py-2 rounded-full border border-slate-700 flex items-center gap-2 text-sm shadow-lg">
+                    <span>📥 Queue:</span>
+                    <span class="font-bold text-yellow-400" id="queueSize">0</span>
+                </div>
+                <button onclick="openReport()"
+                    class="bg-indigo-600 hover:bg-indigo-500 px-5 py-2 rounded-full text-sm font-bold shadow-lg transition-all hover:scale-105 active:scale-95 flex items-center gap-2">
+                    📊 Report
+                </button>
+            </div>
+        </div>
+
+        <!-- Group Summary Cards -->
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6" id="groupCards"></div>
+
+        <!-- Main Table: audit_ledger -->
+        <div class="overflow-x-auto bg-slate-800/50 rounded-2xl border border-slate-700 shadow-2xl backdrop-blur-sm">
+            <table class="w-full text-left border-collapse">
+                <thead>
+                    <tr class="bg-slate-800 text-slate-300 uppercase text-xs tracking-wider border-b border-slate-700">
+                        <th class="p-4 font-semibold">Group</th>
+                        <th class="p-4 font-semibold">Row</th>
+                        <th class="p-4 font-semibold">เวลา</th>
+                        <th class="p-4 font-semibold">Log Source</th>
+                        <th class="p-4 font-semibold">เนื้อหา</th>
+                        <th class="p-4 font-semibold">Hash Chain</th>
+                        <th class="p-4 font-semibold text-center">สถานะ</th>
+                    </tr>
+                </thead>
+                <tbody id="auditBody">
+                    <tr>
+                        <td colspan="7" class="p-10 text-center text-slate-400 animate-pulse">⏳ กำลังสแกนข้อมูล...</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Pagination -->
+        <div class="flex justify-between items-center mt-6" id="paginationArea" style="display:none;">
+            <p class="text-sm text-slate-400" id="pageInfo"></p>
+            <div class="flex gap-2">
+                <button onclick="changePage(-1)" id="btnPrev"
+                    class="px-4 py-2 rounded-lg bg-slate-800 border border-slate-700 text-slate-300 hover:bg-slate-700 transition-colors disabled:opacity-30 disabled:cursor-not-allowed text-sm">
+                    ◀ ก่อนหน้า
+                </button>
+                <button onclick="changePage(1)" id="btnNext"
+                    class="px-4 py-2 rounded-lg bg-slate-800 border border-slate-700 text-slate-300 hover:bg-slate-700 transition-colors disabled:opacity-30 disabled:cursor-not-allowed text-sm">
+                    ถัดไป ▶
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== Report Modal ===== -->
+    <div id="reportModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden items-center justify-center p-4"
+        style="display:none;">
+        <div class="bg-slate-800 rounded-2xl border border-slate-700 shadow-2xl w-full max-w-5xl max-h-[90vh] flex flex-col">
+            <!-- Modal Header -->
+            <div class="flex justify-between items-center p-6 border-b border-slate-700">
+                <div>
+                    <h2 class="text-xl font-bold text-indigo-400">📊 Integrity Report</h2>
+                    <p class="text-xs text-slate-400 mt-1" id="reportTime"></p>
+                </div>
+                <button onclick="closeReport()"
+                    class="w-8 h-8 rounded-full bg-slate-700 hover:bg-slate-600 flex items-center justify-center text-slate-300 transition-colors">✕</button>
+            </div>
+            <!-- Modal Body -->
+            <div class="overflow-y-auto p-6 flex-1" id="reportBody">
+                <p class="text-center text-slate-400 animate-pulse">⏳ กำลังดึงข้อมูลจาก Blockchain...</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // โหลด API Key อัตโนมัติจากฝั่ง Server (ดึงจาก .env)
+        const API_KEY = '{{INJECT_API_KEY}}';
+        const API_BASE = 'http://localhost:3000/api';
+        let currentPage = 1;
+        const PAGE_LIMIT = 40;
+
+        // ===== Source Badge =====
+        function getSourceBadge(source) {
+            const colors = {
+                'general_log': 'bg-blue-500/20 text-blue-400 border-blue-500/30',
+                'api:': 'bg-purple-500/20 text-purple-400 border-purple-500/30',
+                'windows:': 'bg-amber-500/20 text-amber-400 border-amber-500/30'
+            };
+            let color = 'bg-slate-500/20 text-slate-400 border-slate-500/30';
+            for (const [key, val] of Object.entries(colors)) {
+                if (source.startsWith(key) || source === key) { color = val; break; }
+            }
+            return `<span class="px-2 py-0.5 rounded-full text-xs font-medium border ${color}">${source}</span>`;
+        }
+
+        // ===== Status Badge =====
+        function getStatusBadge(status) {
+            const map = {
+                'MATCH': '<span class="px-3 py-1 rounded-full text-xs font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">✅ MATCH</span>',
+                'MISMATCH': '<span class="px-3 py-1 rounded-full text-xs font-bold bg-red-500/10 text-red-500 border border-red-500/50 animate-pulse">🚨 MISMATCH</span>',
+                'PENDING': '<span class="px-3 py-1 rounded-full text-xs font-bold bg-yellow-500/10 text-yellow-400 border border-yellow-500/30">⏳ PENDING</span>',
+                'NOT_ON_CHAIN': '<span class="px-3 py-1 rounded-full text-xs font-bold bg-slate-500/10 text-slate-400 border border-slate-500/30">⏸️ NOT ON CHAIN</span>',
+                'ERROR': '<span class="px-3 py-1 rounded-full text-xs font-bold bg-orange-500/10 text-orange-400 border border-orange-500/30">⚠️ ERROR</span>'
+            };
+            return map[status] || status;
+        }
+
+        // ===== Main Table =====
+        async function fetchStatus() {
+            try {
+                const url = `${API_BASE}/get-status?page=${currentPage}&limit=${PAGE_LIMIT}${API_KEY ? '&apiKey=' + API_KEY : ''}`;
+                const res = await fetch(url);
+                if (res.status === 401) {
+                    document.getElementById('auditBody').innerHTML = `<tr><td colspan="7" class="p-10 text-center text-red-400">🔒 API Key ไม่ถูกต้อง</td></tr>`;
+                    return;
+                }
+
+                const data = await res.json();
+                const rows = data.rows;
+                const pagination = data.pagination;
+                const state = data.state;
+
+                document.getElementById('stateInfo').innerText = `Group ${state.currentGroup} | Row ${state.currentRow}/20`;
+                document.getElementById('queueSize').innerText = state.queueSize;
+
+                // Group Cards
+                document.getElementById('groupCards').innerHTML = (data.groups || []).map(g => {
+                    const isComplete = g.has_anchor === 1;
+                    const isAlert = g.has_alert === 1;
+                    const borderColor = isAlert ? 'border-red-500/50' : isComplete ? 'border-emerald-500/30' : 'border-slate-700';
+                    const icon = isAlert ? '🚨' : isComplete ? '✅' : '⏳';
+                    return `<div class="bg-slate-800/80 rounded-xl p-3 border ${borderColor} text-center">
+                        <div class="text-xs text-slate-400">Group ${g.group_number}</div>
+                        <div class="text-lg font-bold">${icon} ${g.row_count}/20</div>
+                    </div>`;
+                }).join('');
+
+                // Table Rows
+                const tbody = document.getElementById('auditBody');
+                tbody.innerHTML = '';
+                if (rows.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="p-10 text-center text-slate-500">ยังไม่มีข้อมูลในระบบ</td></tr>';
+                    document.getElementById('paginationArea').style.display = 'none';
+                    return;
+                }
+
+                rows.forEach(r => {
+                    const isAnchor = r.is_anchor === 1;
+                    const isAlert = r.is_alert === 1;
+                    const rowBg = isAnchor ? (isAlert ? 'bg-red-900/30' : 'bg-emerald-900/20') : (isAlert ? 'bg-red-900/10' : '');
+                    const tr = document.createElement('tr');
+                    tr.className = `border-b border-slate-700/50 hover:bg-slate-700/30 transition-colors ${rowBg}`;
+                    tr.innerHTML = `
+                        <td class="p-4 font-bold text-slate-300">${r.group_number}</td>
+                        <td class="p-4">
+                            <span class="px-2 py-1 rounded-lg text-xs font-bold ${isAnchor ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30' : 'text-slate-400'}">
+                                ${r.row_index}/20 ${isAnchor ? '⚓' : ''}
+                            </span>
+                        </td>
+                        <td class="p-4 text-sm text-slate-300">${r.event_time}</td>
+                        <td class="p-4">${getSourceBadge(r.log_source)}</td>
+                        <td class="p-4 text-xs text-slate-400 max-w-xs truncate" title="${(r.log_content || '').replace(/"/g, '&quot;')}">
+                            ${r.log_content ? r.log_content.substring(0, 60) + (r.log_content.length > 60 ? '...' : '') : ''}
+                        </td>
+                        <td class="p-4 font-mono text-xs opacity-60">${r.current_hash.substring(0, 20)}...</td>
+                        <td class="p-4 text-center">
+                            ${isAlert
+                                ? '<span class="px-3 py-1 rounded-full text-xs font-bold bg-red-500/10 text-red-500 border border-red-500/50 animate-pulse">🚨 TAMPERED</span>'
+                                : isAnchor
+                                    ? '<span class="px-3 py-1 rounded-full text-xs font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">✅ ON-CHAIN</span>'
+                                    : '<span class="px-3 py-1 rounded-full text-xs font-bold bg-slate-500/10 text-slate-400 border border-slate-500/30">🔗 CHAINED</span>'
+                            }
+                            ${r.tx_hash ? `<p class="text-xs text-slate-500 mt-1 truncate max-w-[120px]" title="${r.tx_hash}">TX: ${r.tx_hash.substring(0, 10)}...</p>` : ''}
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+
+                // Pagination
+                document.getElementById('paginationArea').style.display = pagination.totalPages > 1 ? 'flex' : 'none';
+                document.getElementById('pageInfo').innerText = `หน้า ${pagination.page} จาก ${pagination.totalPages} (ทั้งหมด ${pagination.total} แถว)`;
+                document.getElementById('btnPrev').disabled = currentPage <= 1;
+                document.getElementById('btnNext').disabled = currentPage >= pagination.totalPages;
+                document.getElementById('lastUpdate').innerText = `อัปเดตล่าสุด: ${new Date().toLocaleTimeString()} (รีเฟรชทุก 5 วินาที)`;
+
+            } catch (e) {
+                console.error("เชื่อมต่อ Server ไม่สำเร็จ:", e);
+                document.getElementById('auditBody').innerHTML = `<tr><td colspan="7" class="p-10 text-center text-red-400">❌ ไม่สามารถเชื่อมต่อกับ Server ได้</td></tr>`;
+            }
+        }
+
+        function changePage(delta) {
+            currentPage += delta;
+            if (currentPage < 1) currentPage = 1;
+            fetchStatus();
+        }
+
+        // ===== Report Modal =====
+        async function openReport() {
+            const modal = document.getElementById('reportModal');
+            modal.style.display = 'flex';
+            document.getElementById('reportBody').innerHTML = '<p class="text-center text-slate-400 animate-pulse py-10">⏳ กำลังดึงข้อมูลจาก Blockchain... (อาจใช้เวลาสักครู่)</p>';
+
+            try {
+                const res = await fetch(`${API_BASE}/report${API_KEY ? '?apiKey=' + API_KEY : ''}`);
+                const data = await res.json();
+
+                document.getElementById('reportTime').innerText = `สร้างเมื่อ: ${new Date(data.generatedAt).toLocaleString()}`;
+
+                if (!data.report || data.report.length === 0) {
+                    document.getElementById('reportBody').innerHTML = '<p class="text-center text-slate-500 py-10">ยังไม่มี Group ในระบบ</p>';
+                    return;
+                }
+
+                // Summary Stats
+                const total = data.report.length;
+                const matched = data.report.filter(r => r.status === 'MATCH').length;
+                const mismatched = data.report.filter(r => r.status === 'MISMATCH').length;
+                const pending = data.report.filter(r => r.status === 'PENDING' || r.status === 'NOT_ON_CHAIN').length;
+
+                let html = `
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                        <div class="bg-slate-700/50 rounded-xl p-4 text-center border border-slate-600">
+                            <div class="text-2xl font-bold text-blue-400">${total}</div>
+                            <div class="text-xs text-slate-400 mt-1">Total Groups</div>
+                        </div>
+                        <div class="bg-slate-700/50 rounded-xl p-4 text-center border border-emerald-500/30">
+                            <div class="text-2xl font-bold text-emerald-400">${matched}</div>
+                            <div class="text-xs text-slate-400 mt-1">✅ Verified</div>
+                        </div>
+                        <div class="bg-slate-700/50 rounded-xl p-4 text-center border ${mismatched > 0 ? 'border-red-500/50' : 'border-slate-600'}">
+                            <div class="text-2xl font-bold ${mismatched > 0 ? 'text-red-500 animate-pulse' : 'text-slate-400'}">${mismatched}</div>
+                            <div class="text-xs text-slate-400 mt-1">🚨 Tampered</div>
+                        </div>
+                        <div class="bg-slate-700/50 rounded-xl p-4 text-center border border-slate-600">
+                            <div class="text-2xl font-bold text-yellow-400">${pending}</div>
+                            <div class="text-xs text-slate-400 mt-1">⏳ Pending</div>
+                        </div>
+                    </div>
+                `;
+
+                // Report Table
+                html += `
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left text-sm border-collapse">
+                            <thead>
+                                <tr class="bg-slate-700/50 text-slate-300 uppercase text-xs tracking-wider border-b border-slate-600">
+                                    <th class="p-3">Group</th>
+                                    <th class="p-3">ช่วงเวลา</th>
+                                    <th class="p-3">Audit Hash</th>
+                                    <th class="p-3">Blockchain Hash</th>
+                                    <th class="p-3">TX Hash</th>
+                                    <th class="p-3 text-center">ผลตรวจ</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                `;
+
+                for (const r of data.report) {
+                    const isMismatch = r.status === 'MISMATCH';
+                    const rowClass = isMismatch ? 'bg-red-900/20' : '';
+
+                    html += `
+                        <tr class="border-b border-slate-700/50 ${rowClass}">
+                            <td class="p-3 font-bold ${isMismatch ? 'text-red-400' : 'text-blue-400'}">
+                                Group ${r.group_number}
+                                <div class="text-xs text-slate-500">${r.row_count}/20 rows</div>
+                            </td>
+                            <td class="p-3 text-xs text-slate-300">
+                                ${r.start_time || '-'}<br>
+                                <span class="text-slate-500">ถึง</span> ${r.end_time || '-'}
+                            </td>
+                            <td class="p-3 font-mono text-xs ${isMismatch ? 'text-red-400' : 'opacity-60'}">
+                                ${r.audit_hash ? r.audit_hash.substring(0, 16) + '...' : '-'}
+                            </td>
+                            <td class="p-3 font-mono text-xs ${isMismatch ? 'text-emerald-400' : 'opacity-60'}">
+                                ${r.blockchain_hash ? r.blockchain_hash.substring(0, 16) + '...' : '-'}
+                                ${r.blockchain_timestamp ? `<div class="text-slate-500 mt-1">⏰ ${r.blockchain_timestamp}</div>` : ''}
+                            </td>
+                            <td class="p-3 font-mono text-xs opacity-50">
+                                ${r.tx_hash ? `<a href="https://sepolia.etherscan.io/tx/${r.tx_hash}" target="_blank" class="text-indigo-400 hover:underline">${r.tx_hash.substring(0, 10)}...</a>` : '-'}
+                            </td>
+                            <td class="p-3 text-center">${getStatusBadge(r.status)}</td>
+                        </tr>
+                    `;
+
+                    // ถ้ามี alert rows แสดงรายละเอียด
+                    if (r.alert_rows && r.alert_rows.length > 0) {
+                        html += `
+                            <tr class="bg-red-900/10">
+                                <td colspan="6" class="p-3 pl-8">
+                                    <div class="text-xs text-red-400 font-bold mb-2">🔍 แถวที่ถูก tamper ใน Group ${r.group_number}:</div>
+                                    <div class="space-y-1">
+                        `;
+                        for (const ar of r.alert_rows) {
+                            html += `
+                                <div class="flex items-center gap-3 text-xs bg-red-900/20 rounded-lg px-3 py-2 border border-red-500/20">
+                                    <span class="font-bold text-red-400">Row ${ar.row_index}</span>
+                                    <span class="text-slate-400">${ar.event_time}</span>
+                                    ${getSourceBadge(ar.log_source)}
+                                    <span class="text-slate-300 truncate max-w-xs">${ar.log_content ? ar.log_content.substring(0, 50) + '...' : ''}</span>
+                                    ${ar.tamper_first_detected_at ? `<span class="text-red-500 ml-auto">พบ: ${ar.tamper_first_detected_at}</span>` : ''}
+                                </div>
+                            `;
+                        }
+                        html += '</div></td></tr>';
+                    }
+                }
+
+                html += '</tbody></table></div>';
+                document.getElementById('reportBody').innerHTML = html;
+
+            } catch (e) {
+                console.error("Report Error:", e);
+                document.getElementById('reportBody').innerHTML = '<p class="text-center text-red-400 py-10">❌ ไม่สามารถดึงข้อมูล Report ได้</p>';
+            }
+        }
+
+        function closeReport() {
+            document.getElementById('reportModal').style.display = 'none';
+        }
+
+        // ปิด modal เมื่อกด Escape
+        document.addEventListener('keydown', e => { if (e.key === 'Escape') closeReport(); });
+
+        // เริ่มทำงาน
+        fetchStatus();
+        setInterval(fetchStatus, 5000);
+    </script>
+
+</body>
+
+</html>
