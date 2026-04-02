@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const nodemailer = require('nodemailer');
 
 // ===== Adapter Pattern =====
 const AdapterManager = require('./adapters/manager');
@@ -30,33 +31,74 @@ app.get('/dashboard', (req, res) => {
     }
 });
 
-//  LINE Messaging API 
+//  LINE & Email Messaging API 
 const LINE_CHANNEL_TOKEN = process.env.LINE_CHANNEL_TOKEN;
 const LINE_USER_ID = process.env.LINE_USER_ID;
+const EMAIL_USER = process.env.EMAIL_USER;
+const EMAIL_PASS = process.env.EMAIL_PASS;
+const EMAIL_RECEIVER = process.env.EMAIL_RECEIVER;
 const notifiedGroups = new Set();
 
+let transporter;
+if (EMAIL_USER && EMAIL_PASS) {
+    transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: EMAIL_USER, pass: EMAIL_PASS }
+    });
+}
+
 async function sendLineAlert(groupNum, auditHash, blockchainHash, reason) {
-    if (!LINE_CHANNEL_TOKEN || !LINE_USER_ID) return;
     if (notifiedGroups.has(groupNum)) return;
 
-    const message = ` SECURITY ALERT \n\nพบการดัดแปลง Log!\n Group: ${groupNum}\n สาเหตุ: ${reason}\n Audit Hash: ${auditHash ? auditHash.substring(0, 20) + '...' : 'N/A'}\n Blockchain Hash: ${blockchainHash ? blockchainHash.substring(0, 20) + '...' : 'N/A'}\n เวลา: ${new Date().toLocaleString('th-TH')}\n\n⚠️ Log ในฐานข้อมูลไม่ตรงกับ Blockchain!`;
+    if (LINE_CHANNEL_TOKEN && LINE_USER_ID) {
+        const message = ` SECURITY ALERT \n\nพบการดัดแปลง Log!\n Group: ${groupNum}\n สาเหตุ: ${reason}\n Audit Hash: ${auditHash ? auditHash.substring(0, 20) + '...' : 'N/A'}\n Blockchain Hash: ${blockchainHash ? blockchainHash.substring(0, 20) + '...' : 'N/A'}\n เวลา: ${new Date().toLocaleString('th-TH')}\n\n⚠️ Log ในฐานข้อมูลไม่ตรงกับ Blockchain!`;
 
-    try {
-        const res = await fetch('https://api.line.me/v2/bot/message/push', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${LINE_CHANNEL_TOKEN}` },
-            body: JSON.stringify({ to: LINE_USER_ID, messages: [{ type: 'text', text: message }] })
-        });
-        if (res.ok) {
-            notifiedGroups.add(groupNum);
-            console.log(` LINE แจ้งเตือน Group ${groupNum} สำเร็จ!`);
-        } else {
-            const err = await res.json();
-            console.error(` LINE Error:`, err.message || JSON.stringify(err));
+        try {
+            const res = await fetch('https://api.line.me/v2/bot/message/push', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${LINE_CHANNEL_TOKEN}` },
+                body: JSON.stringify({ to: LINE_USER_ID, messages: [{ type: 'text', text: message }] })
+            });
+            if (res.ok) {
+                console.log(` LINE แจ้งเตือน Group ${groupNum} สำเร็จ!`);
+            } else {
+                const err = await res.json();
+                console.error(` LINE Error:`, err.message || JSON.stringify(err));
+            }
+        } catch (e) {
+            console.error(` LINE ส่งไม่ได้:`, e.message);
         }
-    } catch (e) {
-        console.error(` LINE ส่งไม่ได้:`, e.message);
     }
+
+    if (transporter && EMAIL_RECEIVER && EMAIL_USER) {
+        try {
+            const mailOptions = {
+                from: EMAIL_USER,
+                to: EMAIL_RECEIVER,
+                subject: ` [CRITICAL] พบการดัดแปลง Log - Group ${groupNum}`,
+                html: `
+                    <h3 style="color:red;">แจ้งเตือนความปลอดภัยระบบฐานข้อมูล (Security Audit Engine)</h3>
+                    <p><strong>ระบบตรวจพบการดัดแปลงข้อมูล Log ในฐานข้อมูล!</strong></p>
+                    <ul>
+                        <li><strong>Group Number:</strong> ${groupNum}</li>
+                        <li><strong>สาเหตุ:</strong> ${reason}</li>
+                        <li><strong>Audit Hash:</strong> ${auditHash ? auditHash.substring(0, 20) + '...' : 'N/A'}</li>
+                        <li><strong>Blockchain Hash:</strong> ${blockchainHash ? blockchainHash.substring(0, 20) + '...' : 'N/A'}</li>
+                        <li><strong>เวลาฉุกเฉิน:</strong> ${new Date().toLocaleString('th-TH')}</li>
+                    </ul>
+                    <hr>
+                    <p style="color:gray;"><small>กรุณาลงข้อตรวจสอบระบบด่วน - Auto-generated Notification</small></p>
+                `
+            };
+            await transporter.sendMail(mailOptions);
+            console.log(` Email แจ้งเตือน Group ${groupNum} ส่งสำเร็จ!`);
+        } catch (e) {
+            console.error(` Email ส่งไม่ได้:`, e.message);
+        }
+    }
+
+    // มาร์กไว้ว่าเตือน Group นี้ไปแล้วเพื่อกันการแจ้งเตือนรัวซ้ำ (Deduplication)
+    notifiedGroups.add(groupNum);
 }
 
 //  Middleware 
@@ -88,6 +130,7 @@ const contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, abi, wallet);
 //  Config 
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE) || 20;
 const TIME_TRIGGER_MS = 5 * 60 * 1000;
+const CHECKPOINT_PATH = path.join(__dirname, '.checkpoint.json');
 
 //  State (In-Memory) 
 let currentGroupNumber = 1;
@@ -99,6 +142,33 @@ let isProcessing = false;
 let isAuditing = false;
 let serverRunning = true;
 
+// ═══ Checkpoint File System (ป้องกัน Vulnerability Window) ═══
+function saveCheckpoint() {
+    try {
+        const data = {
+            previousHash,
+            previousMasterHash,
+            currentGroupNumber,
+            currentRowIndex,
+            savedAt: new Date().toISOString()
+        };
+        fs.writeFileSync(CHECKPOINT_PATH, JSON.stringify(data, null, 2), 'utf-8');
+    } catch (e) {
+        console.error(' Checkpoint เขียนไม่ได้:', e.message);
+    }
+}
+
+function loadCheckpoint() {
+    try {
+        if (!fs.existsSync(CHECKPOINT_PATH)) return null;
+        const raw = fs.readFileSync(CHECKPOINT_PATH, 'utf-8');
+        return JSON.parse(raw);
+    } catch (e) {
+        console.error(' Checkpoint อ่านไม่ได้:', e.message);
+        return null;
+    }
+}
+
 //  Adapter Manager (ศูนย์กลาง Log ทุกประเภท) 
 const adapterManager = new AdapterManager();
 let webhookAdapter; // เก็บ reference ไว้ใช้ใน API route
@@ -106,8 +176,7 @@ let webhookAdapter; // เก็บ reference ไว้ใช้ใน API route
 //  1เริ่มต้น Server 
 async function initServer() {
     try {
-        await pool.execute("DROP TABLE IF EXISTS audit_ledger"); //  ล้างตารางเก่าเพื่อเพิ่มคอลัมน์ record_count
-        // สร้างตาราง audit_ledger (ถ้ายังไม่มี)
+        // สร้างตาราง audit_ledger (ถ้ายังไม่มี) — ไม่ DROP ตารางเก่า!
         await pool.execute(`
             CREATE TABLE IF NOT EXISTS audit_ledger (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -129,6 +198,25 @@ async function initServer() {
                 INDEX idx_event_time (event_time)
             )
         `);
+
+        // เพิ่มคอลัมน์ใหม่ (กรณีอัปเกรดจากเวอร์ชันเก่า) — ใช้แทน DROP TABLE
+        const columnsToAdd = [
+            { name: 'master_hash', definition: 'VARCHAR(64)' },
+            { name: 'record_count', definition: 'INT' },
+            { name: 'alert_reason', definition: 'VARCHAR(200)' },
+            { name: 'tamper_first_detected_at', definition: 'DATETIME' }
+        ];
+        for (const col of columnsToAdd) {
+            try {
+                await pool.execute(`ALTER TABLE audit_ledger ADD COLUMN ${col.name} ${col.definition}`);
+                console.log(` เพิ่มคอลัมน์ ${col.name} สำเร็จ`);
+            } catch (e) {
+                // คอลัมน์มีอยู่แล้ว — ข้ามไป
+            }
+        }
+
+        // ═══ Checkpoint Verification (ตรวจ DB vs Checkpoint File) ═══
+        const checkpoint = loadCheckpoint();
 
         // ดึง state ล่าสุดจาก audit_ledger (กรณี restart)
         const [lastRow] = await pool.execute(
@@ -155,6 +243,45 @@ async function initServer() {
             );
             if (lastAnchor.length > 0 && lastAnchor[0].master_hash) {
                 previousMasterHash = lastAnchor[0].master_hash;
+            }
+
+            // ═══ เทียบ Checkpoint กับ DB ═══
+            if (checkpoint) {
+                let mismatch = false;
+                const reasons = [];
+
+                if (checkpoint.previousHash !== previousHash) {
+                    reasons.push(`Hash: checkpoint=${checkpoint.previousHash.substring(0,16)}... vs DB=${previousHash.substring(0,16)}...`);
+                    mismatch = true;
+                }
+                if (checkpoint.currentGroupNumber !== currentGroupNumber || checkpoint.currentRowIndex !== currentRowIndex) {
+                    reasons.push(`Position: checkpoint=G${checkpoint.currentGroupNumber}/R${checkpoint.currentRowIndex} vs DB=G${currentGroupNumber}/R${currentRowIndex}`);
+                    mismatch = true;
+                }
+                if (checkpoint.previousMasterHash !== previousMasterHash) {
+                    reasons.push(`MasterHash: checkpoint=${checkpoint.previousMasterHash.substring(0,16)}... vs DB=${previousMasterHash.substring(0,16)}...`);
+                    mismatch = true;
+                }
+
+                if (mismatch) {
+                    const alertMsg = `⚠️ CHECKPOINT MISMATCH! ข้อมูลใน DB อาจถูกดัดแปลงขณะ Server ปิดอยู่!\n${reasons.join('\n')}`;
+                    console.error(alertMsg);
+
+                    // ใช้ค่าจาก Checkpoint (เชื่อถือกว่า DB) เพราะ Checkpoint เขียนจาก RAM ขณะทำงาน
+                    previousHash = checkpoint.previousHash;
+                    previousMasterHash = checkpoint.previousMasterHash;
+                    currentGroupNumber = checkpoint.currentGroupNumber;
+                    currentRowIndex = checkpoint.currentRowIndex;
+                    console.log(' ใช้ค่าจาก Checkpoint แทน DB (เชื่อถือกว่า)');
+
+                    // แจ้งเตือนผ่าน LINE
+                    await sendLineAlert('CHECKPOINT', null, null, alertMsg);
+                } else {
+                    console.log(' ✅ Checkpoint ตรงกับ DB — ไม่มีสัญญาณการดัดแปลง');
+                }
+            } else {
+                console.log(' ℹ️ ไม่พบ Checkpoint file (เริ่มใช้งานครั้งแรก)');
+                saveCheckpoint(); // สร้าง checkpoint แรก
             }
         }
 
@@ -211,6 +338,7 @@ async function processNextLog() {
 
             console.log(` [${logEntry.source}] Group ${currentGroupNumber} | Row ${currentRowIndex}/${BATCH_SIZE} | Hash: ${currentHash.substring(0, 16)}...`);
             previousHash = currentHash;
+            saveCheckpoint(); // บันทึก state ลงดิสก์ทุกครั้งที่ Hash เปลี่ยน
 
             //  Dual Trigger: ครบ BATCH_SIZE → ส่งเชนทันที 
             if (currentRowIndex >= BATCH_SIZE) {
@@ -261,12 +389,13 @@ async function commitToBlockchain(triggerReason) {
         currentGroupNumber++;
         currentRowIndex = 0;
         lastCommitTime = Date.now();
+        saveCheckpoint(); // บันทึก state หลัง commit ขึ้น Blockchain
     } catch (bcError) {
         console.error(` Blockchain fail!`, bcError.message);
     }
 }
 
-//  3 Audit: ตรวจ Hash Chain + Sequence + Count
+//  3 Audit: ตรวจ Hash Chain + Sequence + Count + Group Count
 async function runAudit() {
     if (isAuditing) return;
     try {
@@ -276,6 +405,21 @@ async function runAudit() {
             "SELECT DISTINCT group_number FROM audit_ledger WHERE is_anchor = 1 ORDER BY group_number ASC"
         );
         if (allGroups.length === 0) return;
+
+        // ═══ CHECK 0: Group Count (เทียบจำนวน Group กับ Blockchain) ═══
+        if (process.env.CONTRACT_ADDRESS) {
+            try {
+                const onChainTotal = Number(await contract.totalGroups());
+                const dbGroupCount = allGroups.length;
+                if (dbGroupCount < onChainTotal) {
+                    const reason = `Group count mismatch: DB=${dbGroupCount} groups, Blockchain=${onChainTotal} groups — อาจมี Group ถูกลบออกจาก DB!`;
+                    console.log(` [GroupCount] ${reason}`);
+                    await sendLineAlert('GROUP_COUNT', null, null, reason);
+                }
+            } catch (e) {
+                console.error(' CHECK 0 error:', e.message);
+            }
+        }
 
         console.log(` [Audit] ตรวจสอบ ${allGroups.length} groups...`);
         let calcMasterHash = '0000000000000000000000000000000000000000000000000000000000000000';
@@ -340,10 +484,21 @@ async function runAudit() {
 
             calcMasterHash = crypto.createHash('sha256').update(calcBatchHash + calcMasterHash).digest('hex');
 
-            // เทียบกับ Blockchain
+            // เทียบกับ Blockchain (ตรวจทั้ง Master Hash + Batch Hash)
             if (process.env.CONTRACT_ADDRESS) {
                 try {
                     const onChain = await contract.getLog(`GROUP_${groupNum}`);
+
+                    // CHECK 3a: Batch Hash
+                    if (onChain.batchHash !== calcBatchHash) {
+                        const reason = `Batch Hash mismatch! DB=${calcBatchHash.substring(0,16)}... vs Chain=${onChain.batchHash.substring(0,16)}...`;
+                        console.log(` [BatchHash] Group ${groupNum}: ${reason}`);
+                        await pool.execute("UPDATE audit_ledger SET is_alert = 1, alert_reason = ?, tamper_first_detected_at = COALESCE(tamper_first_detected_at, NOW()) WHERE group_number = ?", [reason, groupNum]);
+                        await sendLineAlert(groupNum, calcBatchHash, onChain.batchHash, reason);
+                        break;
+                    }
+
+                    // CHECK 3b: Master Hash
                     if (onChain.masterHash !== calcMasterHash) {
                         const reason = 'Master Hash mismatch with Blockchain!';
                         console.log(` [Hash] Group ${groupNum}: ${reason}`);
@@ -460,7 +615,8 @@ initServer().then(() => {
     intervals.push(setInterval(runAudit, 5 * 60 * 1000));      // Audit ทุก 5 นาที
 
     console.log(` Batch: ${BATCH_SIZE} logs/group | Time Trigger: ${TIME_TRIGGER_MS / 60000} นาที`);
-    console.log(` ตรวจ 3 ชั้น: Hash Chain | Sequence | Count`);
+    console.log(` ตรวจ 4 ชั้น: Group Count | Sequence | Count | Hash Chain (Batch+Master)`);
+    console.log(` Checkpoint: ${CHECKPOINT_PATH}`);
     console.log(` Adapters: MySQL | Windows | Webhook`);
 });
 
