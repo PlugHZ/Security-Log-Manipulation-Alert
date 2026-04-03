@@ -58,8 +58,20 @@ class WindowsEventAdapter extends BaseAdapter {
     }
 
     normalize(rawLog) {
-        const eventTime = new Date(rawLog.TimeCreated)
-            .toISOString().slice(0, 19).replace('T', ' ');
+        let ts = rawLog.TimeCreated;
+        // PowerShell 5.1 ConvertTo-Json ส่งวันที่มาในรูปแบบ "/Date(1234567890)/"
+        if (typeof ts === 'string' && ts.includes('/Date(')) {
+            const match = ts.match(/\d+/);
+            if (match) ts = parseInt(match[0], 10);
+        }
+
+        let eventTime;
+        try {
+            eventTime = new Date(ts).toISOString().slice(0, 19).replace('T', ' ');
+        } catch (e) {
+            // สำรองกรณีเกิด Error แปลกๆ อีก
+            eventTime = new Date().toISOString().slice(0, 19).replace('T', ' ');
+        }
         
         const channel = rawLog._channel || 'Unknown';
         const level = rawLog.LevelDisplayName || 'INFO';
